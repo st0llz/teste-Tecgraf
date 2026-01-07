@@ -52,69 +52,6 @@ class PostProcess:
         return df
 
     @staticmethod
-    def read_zone_dat(file):
-        """
-        Lê arquivos .dat de zonas (como os de fieldMinMax), com suporte para campos vetoriais.
-        Expande cabeçalhos como 'max(U)' em 'max(U)_x', 'max(U)_y', 'max(U)_z'.
-        """
-        with open(file, 'r') as f:
-            lines = f.readlines()
-
-        if not lines:
-            return None
-
-        header_line_index = -1
-        for i, line in enumerate(lines):
-            if line.strip().startswith('#') and 'Time' in line:
-                header_line_index = i
-                break
-        
-        # Se não encontrar um cabeçalho de zona, tenta usar o leitor padrão
-        if header_line_index == -1: return PostProcess.read_DAT(file)
-
-        header_fields = lines[header_line_index].strip().replace('#', '').strip().split()
-        
-        data_rows = []
-        for line in lines[header_line_index + 1:]:
-            if line.strip() and not line.strip().startswith('#'):
-                cleaned_line = re.sub(r'[()]', '', line)
-                data_rows.append(cleaned_line.strip().split())
-        
-        if not data_rows: return None
-
-        num_data_cols = len(data_rows[0])
-        
-        expanded_header = []
-        col_cursor = 0
-        field_cursor = 0
-        while field_cursor < len(header_fields):
-            field_name = header_fields[field_cursor]
-            
-            if field_name == 'Time':
-                expanded_header.append('Time')
-                col_cursor += 1
-                field_cursor += 1
-                continue
-            
-            is_vector = '(U)' in field_name and (col_cursor + 2 < num_data_cols)
-
-            if is_vector:
-                expanded_header.extend([f"{field_name}_x", f"{field_name}_y", f"{field_name}_z"])
-                col_cursor += 3
-            else:
-                expanded_header.append(field_name)
-                col_cursor += 1
-            field_cursor += 1
-        
-        if len(expanded_header) != num_data_cols:
-            return PostProcess.read_DAT(file)
-
-        df = pd.DataFrame(data_rows, columns=expanded_header)
-        df = df.apply(pd.to_numeric, errors='coerce').set_index('Time')
-        
-        return df
-
-    @staticmethod
     def convert_dat_h5(fname_force, fname_moment, fname_h5):
         data_force = PostProcess.read_DAT(fname_force)
         data_moment = PostProcess.read_DAT(fname_moment)
@@ -153,18 +90,16 @@ class PostProcess:
         return data
 
     @staticmethod
-    def process_case_to_h5_unified(base_path):
+    def process_case_to_h5(base_path):
         """
         Processa um diretório para encontrar e unificar dados de todas as pastas 'case_*',
         ou processa uma única pasta 'case_*' se o caminho for fornecido diretamente.
         Unifica dados de 'force/moment' e 'zone' em arquivos HDF5.
         """
         case_paths = []
-        # Verifica se o caminho fornecido já é uma pasta de caso
         if os.path.basename(os.path.normpath(base_path)).startswith('case_'):
             case_paths.append(base_path)
         else:
-            # Se não for, procura por pastas 'case_*' dentro do diretório
             case_folders = [d for d in os.listdir(base_path) if d.startswith('case_') and os.path.isdir(os.path.join(base_path, d))]
             if not case_folders:
                 print(f"Nenhuma pasta 'case_*' encontrada em '{base_path}'")
@@ -174,7 +109,7 @@ class PostProcess:
         for case_path in case_paths:
             print(f"\n--- Processando Case: {os.path.basename(case_path)} ---")
             case_name = os.path.basename(os.path.normpath(case_path))
-            h5_filename = os.path.join(os.path.dirname(case_path), f'{case_name}_unified.h5')
+            h5_filename = os.path.join(os.path.dirname(case_path), f'{case_name}.h5')
 
             with h5py.File(h5_filename, 'w') as h5_file:
                 sim_dirs_names = [d for d in os.listdir(case_path) if d.startswith('sim_') and os.path.isdir(os.path.join(case_path, d))]
@@ -197,7 +132,6 @@ class PostProcess:
 
                     all_data_merged = pd.DataFrame()
 
-                    # 1. Processa dados genéricos (não-zona)
                     data_folders = [d for d in os.listdir(post_processing_path) if os.path.isdir(os.path.join(post_processing_path, d)) and not d.startswith('Zone_')]
                     for folder in data_folders:
                         search_dirs = [os.path.join(post_processing_path, folder)]
@@ -207,19 +141,22 @@ class PostProcess:
                         for s_dir in search_dirs:
                             for dat_file_name in [f for f in os.listdir(s_dir) if f.endswith('.dat')]:
                                 df = PostProcess.read_DAT(os.path.join(s_dir, dat_file_name))
-
+                                
                                 if dat_file_name == 'solverInfo.dat':
                                     cols_to_keep = [c for c in df.columns if c.endswith('_final')]
                                     df = df[cols_to_keep]
 
                                 if not df.empty: 
-                                    prefix = f"{os.path.splitext(dat_file_name)[0]}_"
+                                    if folder.startswith('forces_Body'):
+                                        prefix = f"{folder}_{os.path.splitext(dat_file_name)[0]}_"
+                                    else:
+                                        prefix = f"{os.path.splitext(dat_file_name)[0]}_"
+                                    
                                     df = df.add_prefix(prefix)
                                     all_data_merged = pd.merge(all_data_merged, df, left_index=True, right_index=True, how='outer')
 
-                    # 2. Processa dados de Zonas
                     zone_pattern = re.compile(r'^Zone_(\d+)_.*')
-                    zone_folders = [d for d in os.listdir(post_processing_path) if zone_pattern.match(d) and os.path.isdir(os.path.join(post_processing_path, d))]
+                    zone_folders = [d for d in os.listdir(post_processing_path) if zone_pattern.match(d) and '_max' in d and '_max']
                     data_by_zone = {}
                     for zone_folder in zone_folders:
                         match = zone_pattern.match(zone_folder)
@@ -231,10 +168,65 @@ class PostProcess:
 
                         for s_dir in search_dirs:
                             for dat_file_name in [f for f in os.listdir(s_dir) if f.endswith('.dat')]:
-                                df = PostProcess.read_zone_dat(os.path.join(s_dir, dat_file_name))
+                                file_path = os.path.join(s_dir, dat_file_name)
+                                with open(file_path, 'r') as f:
+                                    lines = f.readlines()
+
+                                if not lines:
+                                    df = None
+                                else:
+                                    header_line_index = -1
+                                    for i, line in enumerate(lines):
+                                        if line.strip().startswith('#') and 'Time' in line:
+                                            header_line_index = i
+                                            break
+                                    
+                                    if header_line_index == -1:
+                                        df = PostProcess.read_DAT(file_path)
+                                    else:
+                                        header_fields = lines[header_line_index].strip().replace('#', '').strip().split()
+                                        
+                                        data_rows = []
+                                        for line in lines[header_line_index + 1:]:
+                                            if line.strip() and not line.strip().startswith('#'):
+                                                cleaned_line = re.sub(r'[()]', '', line)
+                                                data_rows.append(cleaned_line.strip().split())
+                                        
+                                        if not data_rows:
+                                            df = None
+                                        else:
+                                            num_data_cols = len(data_rows[0])
+                                            
+                                            expanded_header = []
+                                            col_cursor = 0
+                                            field_cursor = 0
+                                            while field_cursor < len(header_fields):
+                                                field_name = header_fields[field_cursor]
+                                                
+                                                if field_name == 'Time':
+                                                    expanded_header.append('Time')
+                                                    field_cursor += 1
+                                                    continue
+                                                
+                                                is_vector = '(U)' in field_name and (col_cursor + 2 < num_data_cols)
+
+                                                if is_vector:
+                                                    expanded_header.extend([f"{field_name}_x", f"{field_name}_y", f"{field_name}_z"])
+                                                    col_cursor += 3
+                                                else:
+                                                    expanded_header.append(field_name)
+                                                    col_cursor += 1
+                                                field_cursor += 1
+                                            
+                                            if len(expanded_header) != num_data_cols:
+                                                df = PostProcess.read_DAT(file_path)
+                                            else:
+                                                df = pd.DataFrame(data_rows, columns=expanded_header)
+                                                df = df.apply(pd.to_numeric, errors='coerce').set_index('Time')
+
                                 if df is not None and not df.empty:
                                     if zone_id not in data_by_zone: data_by_zone[zone_id] = pd.DataFrame()
-                                    prefix = f"Zone{zone_id}_{zone_folder.replace(f'Zone_{zone_id}_', '')}_{os.path.splitext(dat_file_name)[0]}_"
+                                    prefix = f"{zone_folder}_{os.path.splitext(dat_file_name)[0]}_"
                                     df = df.add_prefix(prefix)
                                     data_by_zone[zone_id] = pd.merge(data_by_zone[zone_id], df, left_index=True, right_index=True, how='outer')
 
@@ -256,18 +248,17 @@ class PostProcess:
                     sim_group.create_dataset('data', data=all_data_merged.to_records(index=False))
                     print(f'Success: {sim_dir_name} salvo em {sim_group_name}.')
 
-            print(f'\nArquivo HDF5 unificado "{h5_filename}" criado com sucesso.')
-
+            print(f'\nArquivo HDF5 "{h5_filename}" criado com sucesso.')
 
 if __name__ == '__main__':
     # --- Exemplo de uso simples ---
     # Defina o caminho para a pasta que você quer processar.
     # Pode ser o diretório que contém as pastas 'case_*' (ex: 'P57_results_monitor')
-    # ou o caminho direto para uma pasta de caso (ex: 'P57_results_monitor\case_1')
+    # ou o caminho direto para uma pasta de caso (ex: 'P66\P66_Sstabdiagram2_scrape\case_1')
     
-    path_para_processar = r'D:\DATA\P66\P66_Sstabdiagram2_scrape'
+    path_para_processar = r'D:\DATA\P57\P57_results_monitor'
 
     if os.path.exists(path_para_processar):
-        PostProcess.process_case_to_h5_unified(path_para_processar)
+        PostProcess.process_case_to_h5(path_para_processar)
     else:
         print(f"Caminho não encontrado: {path_para_processar}")
